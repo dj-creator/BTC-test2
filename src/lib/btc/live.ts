@@ -1,6 +1,6 @@
 import { create } from "zustand";
 
-export type Sample = { t: number; px: number };
+export type Sample = { t: number; px: number; origin?: "candle" };
 export type FeedStatus = "connecting" | "live" | "delayed" | "reconnecting";
 
 type LiveState = {
@@ -26,12 +26,14 @@ export const useLive = create<LiveState>((set) => ({
   samples: [],
   applyBatch: (batch) => {
     if (!batch.length) return;
+    batch = batch.filter((r) => Number.isFinite(r.t) && Number.isFinite(r.px) && r.px > 0).sort((a, b) => a.t - b.t);
     const last = batch[batch.length - 1];
     if (!last) return;
     set((state) => {
+      if (state.tickAt != null && last.t < state.tickAt) return state;
       const cutoff = last.t - KEEP_MS;
       const kept = state.samples.filter((row) => row.t >= cutoff);
-      const samples = kept.concat(batch).slice(-4000);
+      const samples = kept.concat(batch.filter((r) => r.t >= (state.tickAt ?? 0))).sort((a, b) => a.t - b.t).slice(-12000);
       const flash =
         state.price == null || last.px === state.price ? null : last.px > state.price ? "up" : "down";
       return {
@@ -48,7 +50,7 @@ export const useLive = create<LiveState>((set) => ({
     if (!older.length) return;
     set((state) => {
       const oldest = state.samples[0]?.t ?? Number.POSITIVE_INFINITY;
-      const extra = older.filter((row) => row.t < oldest && row.px > 0);
+      const extra: Sample[] = older.filter((row) => row.t < oldest && row.px > 0).map((row) => ({ ...row, origin: "candle" as const }));
       if (!extra.length) return state;
       const cutoff = Date.now() - KEEP_MS;
       return { samples: extra.concat(state.samples).filter((row) => row.t >= cutoff).slice(-4000) };
@@ -347,6 +349,11 @@ function connect() {
   ws.onerror = () => ws.close();
   ws.onclose = () => {
     if (socket === ws) socket = null;
+    bids.clear();
+    asks.clear();
+    if (bookTimer) clearTimeout(bookTimer);
+    bookTimer = null;
+    useBook.getState().setBook({ status: "unavailable", bidNear: 0, askNear: 0, imbalance: null, spread: null, updatedAt: null });
     if (users > 0) scheduleReconnect();
   };
 }
@@ -417,5 +424,7 @@ export function priceAgo(samples: Sample[], ms: number, now = Date.now()) {
       break;
     }
   }
-  return prior;
+  // Candle seeding is minute resolution; do not fabricate second-resolution moves.
+  const tolerance = ms < 60_000 ? 2000 : 65_000;
+  return prior && !(ms < 60_000 && prior.origin === "candle") && target - prior.t <= tolerance ? prior : null;
 }

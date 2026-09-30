@@ -59,7 +59,7 @@ export function readPulse(input: {
     } else if (Math.abs(d60) < 6 && Math.abs(d180) < 12) {
       accel = "flat";
       accelText = "FLAT";
-    } else if (Math.sign(d30) === Math.sign(d60) && Math.abs(d60) > Math.abs(d30) * 1.15) {
+    } else if (Math.sign(d30) === Math.sign(d60) && Math.abs(d30) > Math.abs(d60 - d30) * 1.15) {
       accel = d60 > 0 ? "up" : "down";
       accelText = d60 > 0 ? "ACCELERATING UP" : "ACCELERATING DOWN";
     } else {
@@ -74,7 +74,7 @@ export function readPulse(input: {
   const buyPct = flowTotal > 5_000 && recent.length >= 8 ? buy / flowTotal : null;
   const flowText = buyPct == null ? "DATA UNAVAILABLE" : buyPct >= 0.56 ? "BUYERS IN CONTROL" : buyPct <= 0.44 ? "SELLERS IN CONTROL" : "BALANCED";
   const bookLean: Lean =
-    input.book.imbalance == null ? "wait" : input.book.imbalance > 0.12 ? "yes" : input.book.imbalance < -0.12 ? "no" : "wait";
+    input.book.status !== "live" || input.book.updatedAt == null || now - input.book.updatedAt > 5000 || input.book.imbalance == null ? "wait" : input.book.imbalance > 0.12 ? "yes" : input.book.imbalance < -0.12 ? "no" : "wait";
   const bookText =
     input.book.status !== "live" || input.book.imbalance == null
       ? "DATA UNAVAILABLE"
@@ -88,8 +88,8 @@ export function readPulse(input: {
   const d15 = moves[5]?.delta ?? null;
   const abs15 = d15 == null ? 0 : Math.abs(d15);
   const regime =
-    abs15 > 180 ? (d15 != null && d15 > 0 ? "TRENDING UP" : "TRENDING DOWN") : abs15 < 25 ? "QUIET" : abs15 < 70 ? "RANGE / CHOP" : "TRANSITION";
-  const vol: Pulse["vol"] = abs15 > 280 ? "EXTREME" : abs15 > 140 ? "HIGH" : abs15 < 20 ? "LOW" : d15 == null ? "UNKNOWN" : "NORMAL";
+    d15 == null ? "UNKNOWN" : abs15 > 180 ? (d15 != null && d15 > 0 ? "TRENDING UP" : "TRENDING DOWN") : abs15 < 25 ? "QUIET" : abs15 < 70 ? "RANGE / CHOP" : "TRANSITION";
+  const vol: Pulse["vol"] = d15 == null ? "UNKNOWN" : abs15 > 280 ? "EXTREME" : abs15 > 140 ? "HIGH" : abs15 < 20 ? "LOW" : "NORMAL";
   const priceUp = input.price != null && input.start != null ? input.price - input.start > 8 : d60 != null && d60 > 8;
   const priceDown = input.price != null && input.start != null ? input.price - input.start < -8 : d60 != null && d60 < -8;
   const disagree =
@@ -97,8 +97,8 @@ export function readPulse(input: {
     (priceDown && ((buyPct != null && buyPct > 0.58) || bookLean === "yes" || accel === "reversal"));
   const reversal: Pulse["reversal"] = input.price == null ? "UNKNOWN" : disagree && vol === "HIGH" ? "HIGH" : disagree ? "MEDIUM" : "LOW";
   const vwapTrades = input.trades.filter((row) => row.t >= now - 15 * 60_000);
-  const notion = vwapTrades.reduce((a, b) => a + b.usd, 0);
-  const vwap = notion > 0 ? vwapTrades.reduce((a, b) => a + b.px * b.usd, 0) / notion : null;
+  const notion = vwapTrades.reduce((a, b) => a + b.btc, 0);
+  const vwap = notion > 0 ? vwapTrades.reduce((a, b) => a + b.px * b.btc, 0) / notion : null;
   const vwapSide: Pulse["vwapSide"] =
     vwap == null || input.price == null ? "unknown" : input.price >= vwap ? "above" : "below";
   const priceLean: Lean = input.price == null || input.start == null ? "wait" : input.price - input.start > 8 ? "yes" : input.price - input.start < -8 ? "no" : "wait";

@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { startCoinbaseFeed, useBook, useFlow, useLive, priceAgo, type BookView, type FlowTrade, type LiqPrint } from "@/lib/btc/live";
-import { outlookNow, scorePastWindows } from "@/lib/btc/outlook";
+import { outlookNow } from "@/lib/btc/outlook";
 import { readPulse, type Lean } from "@/lib/btc/pulse";
 import { readWhales } from "@/lib/btc/intel";
 import { getSnapshot } from "@/lib/btc/snapshot";
@@ -9,18 +9,11 @@ import { startRadar, useRadar, type RadarReading } from "@/lib/btc/radar";
 import type { Candle, SettledWindow, Snapshot } from "@/lib/btc/types";
 import { PriceChart } from "./chart";
 
-const STORE = "btc-window-frozen-v1";
+import { captureForecast, settleForecasts, evaluationSummary, parseForecasts, type ForecastRecord } from "@/lib/btc/evaluation";
 
-type Frozen = {
-  start: number;
-  pUp: number | null;
-  call: "YES" | "NO" | "WAIT";
-  price: number;
-  startPx: number;
-  settledPx: number | null;
-  result: "CORRECT" | "WRONG" | "WAIT" | null;
-  radar?: RadarReading | null;
-};
+const STORE = "btc-window-frozen-v2";
+
+type Frozen = ForecastRecord;
 
 function money(n: number | null | undefined) {
   if (n == null || Number.isNaN(n)) return "—";
@@ -84,16 +77,15 @@ function leanClass(lean: Lean | "warn") {
 
 function loadFrozen(): Frozen[] {
   try {
-    const raw = localStorage.getItem(STORE);
-    const rows = raw ? (JSON.parse(raw) as Frozen[]) : [];
-    return Array.isArray(rows) ? rows : [];
+    return parseForecasts(localStorage.getItem(STORE));
   } catch {
     return [];
   }
 }
 
 function saveFrozen(rows: Frozen[]) {
-  localStorage.setItem(STORE, JSON.stringify(rows.slice(0, 80)));
+  try { localStorage.setItem(STORE, JSON.stringify(rows)); return true; }
+  catch { return false; }
 }
 
 export function Terminal({ initial }: { initial: Snapshot }) {
@@ -101,15 +93,17 @@ export function Terminal({ initial }: { initial: Snapshot }) {
     queryKey: ["btc-snapshot"],
     queryFn: () => getSnapshot(),
     initialData: initial,
-    refetchInterval: 15_000,
+    refetchInterval: 10_000,
   });
-  const [spot, setSpot] = useState<number | null>(null);
+  const [spot, setSpot] = useState<number | null>(initial.spot);
+  const [spotAt, setSpotAt] = useState<number | null>(initial.spotAt);
+  const [storageOk, setStorageOk] = useState(true);
   const [flow, setFlow] = useState<{ trades: FlowTrade[]; liqs: LiqPrint[]; book: BookView }>({
     trades: [],
     liqs: [],
     book: { status: "connecting", bidNear: 0, askNear: 0, imbalance: null, spread: null, updatedAt: null },
   });
-  const [win, setWin] = useState(() => windowStartSec());
+  const [win, setWin] = useState(() => windowStartSec(initial.fetchedAt));
   const [now, setNow] = useState<number | null>(null);
   const [frozen, setFrozen] = useState<Frozen[]>([]);
   const [core, setCore] = useState(false);
@@ -118,25 +112,26 @@ export function Terminal({ initial }: { initial: Snapshot }) {
   const [kalshiPath, setKalshiPath] = useState<{ t: number; yes: number }[]>([]);
   const candles = query.data.candles;
   const dayCandles = query.data.dayCandles ?? [];
-  const marketStrike = query.data.market?.strike ?? null;
-  const marketOpen = query.data.market?.openTime ?? null;
-  const strikeMatches =
-    marketStrike != null && marketOpen != null && Math.abs(marketOpen / 1000 - win) < 180;
-  const start = strikeMatches ? marketStrike : startPrice(candles, win);
+  const start = startPrice(candles, win);
+  const currentMarket = query.data.market;
+  const marketMatches = currentMarket != null && currentMarket.openTime <= (now ?? initial.fetchedAt) && currentMarket.closeTime > (now ?? initial.fetchedAt) && Math.abs(currentMarket.closeTime / 1000 - win - 900) < 1;
+  const bookFresh = query.data.bookAt != null && (now ?? initial.fetchedAt) - query.data.bookAt >= -2000 && (now ?? initial.fetchedAt) - query.data.bookAt <= 30_000;
 
   useEffect(() => startCoinbaseFeed(), []);
   useEffect(() => startRadar(), []);
   useEffect(() => setFrozen(loadFrozen()), []);
   useEffect(() => {
     if (!candles.length) return;
-    useLive.getState().seedHistory(candles.slice(-20).map((c) => ({ t: c.t * 1000 + 59_000, px: c.c })));
+    useLive.getState().seedHistory(candles.filter((c) => (c.t + 60) * 1000 <= Date.now()).slice(-20).map((c) => ({ t: c.t * 1000 + 59_000, px: c.c })));
   }, [candles]);
   useEffect(() => {
     setNow(Date.now());
     const id = window.setInterval(() => {
       const live = useLive.getState();
       const book = useBook.getState();
-      setSpot(live.price);
+      const useStream = (live.tickAt ?? 0) >= (query.data.spotAt ?? 0);
+      setSpot(useStream ? live.price : query.data.spot);
+      setSpotAt(useStream ? live.tickAt : query.data.spotAt);
       setFlow({
         trades: useFlow.getState().trades,
         liqs: useFlow.getState().liqs,
@@ -154,7 +149,14 @@ export function Terminal({ initial }: { initial: Snapshot }) {
       setWin((prev) => (prev === next ? prev : next));
     }, 1000);
     return () => window.clearInterval(id);
-  }, []);
+  }, [query.data.spot, query.data.spotAt]);
+
+  useEffect(() => {
+    if (query.data.spotAt != null && (useLive.getState().tickAt ?? 0) < query.data.spotAt) {
+      setSpot(query.data.spot);
+      setSpotAt(query.data.spotAt);
+    }
+  }, [query.data.spot, query.data.spotAt]);
 
   const clock = now ?? 0;
   const view = useMemo(
@@ -164,54 +166,26 @@ export function Terminal({ initial }: { initial: Snapshot }) {
         spot: spot,
         start,
         windowStart: win,
-        asks: query.data.market,
+        asks: null,
+        spotAt,
         now: clock || Date.now(),
       }),
-    [candles, spot, start, win, query.data.market, clock],
+    [candles, spot, spotAt, start, win, clock],
   );
   const pulse = useMemo(
     () => readPulse({ price: spot, samples: useLive.getState().samples, trades: flow.trades, liqs: flow.liqs, book: flow.book, start, now: clock || Date.now() }),
     [spot, flow, start, clock],
   );
   const whales = useMemo(() => readWhales(flow.trades, flow.liqs, clock || Date.now()), [flow, clock]);
-  const scored = useMemo(() => scorePastWindows(candles), [candles]);
 
   useEffect(() => {
-    if (!now || spot == null || start == null || view.outlook.confidence == null) return;
-    setFrozen((prev) => {
-      const call = view.outlook.signal === "up" ? "YES" : view.outlook.signal === "down" ? "NO" : "WAIT";
-      const existing = prev.find((row) => row.start === win);
-      let next = prev;
-      if (!existing) {
-        next = [
-          {
-            start: win,
-            pUp: view.model.pUp,
-            call,
-            price: spot,
-            startPx: start,
-            settledPx: null,
-            result: null,
-            radar: useRadar.getState().reading.ready ? useRadar.getState().reading : null,
-          },
-          ...prev,
-        ];
-      } else if (existing.radar == null && useRadar.getState().reading.ready) {
-        next = prev.map((row) => (row.start === win ? { ...row, radar: useRadar.getState().reading } : row));
-      }
-      const settled = next.map((row) => {
-        if (row.result || row.start >= win) return row;
-        const close = candles.find((c) => c.t >= row.start + 840 && c.t < row.start + 900)?.c ?? null;
-        if (close == null) return row;
-        const up = close >= row.startPx;
-        const result = row.call === "WAIT" ? "WAIT" : row.call === "YES" ? (up ? "CORRECT" : "WRONG") : up ? "WRONG" : "CORRECT";
-        return { ...row, settledPx: close, result } as Frozen;
-      });
-      if (JSON.stringify(settled) === JSON.stringify(prev)) return prev;
-      saveFrozen(settled);
-      return settled;
-    });
-  }, [now, spot, start, view.outlook.signal, view.outlook.confidence, view.model.pUp, win, candles]);
+    if (now == null) return;
+    setFrozen((prev) => settleForecasts(captureForecast(prev, {
+      now, start: win, pUp: view.model.paused ? null : view.model.pUp, price: spot, startPx: start,
+    }), candles, now));
+  }, [now, spot, start, view.model.paused, view.model.pUp, win, candles]);
+
+  useEffect(() => { if (frozen.length) setStorageOk(saveFrozen(frozen)); }, [frozen]);
 
   const signal = view.outlook.signal;
   const lean: Lean = signal === "up" ? "yes" : signal === "down" ? "no" : "wait";
@@ -219,7 +193,7 @@ export function Terminal({ initial }: { initial: Snapshot }) {
   const move = spot != null && start != null ? spot - start : null;
   const left = now == null ? null : Math.max(0, (win + 900) * 1000 - now);
   const windowCandles = withLiveCandle(candles, spot, Math.floor((now ?? Date.now()) / 1000));
-  const market = query.data.market;
+  const market = marketMatches && bookFresh ? currentMarket : null;
   const kalshiYes =
     market?.yesBid != null && market.yesAsk != null && market.yesBid > 0 && market.yesAsk > 0
       ? (market.yesBid + market.yesAsk) / 2
@@ -229,7 +203,7 @@ export function Terminal({ initial }: { initial: Snapshot }) {
   const kalshiNo = kalshiYes == null ? null : 1 - kalshiYes;
 
   useEffect(() => {
-    if (kalshiYes == null) return;
+    if (kalshiYes == null) { setKalshiPath([]); return; }
     setKalshiPath((prev) => {
       const last = prev[prev.length - 1];
       const t = Date.now();
@@ -245,7 +219,7 @@ export function Terminal({ initial }: { initial: Snapshot }) {
   const kalshiUp = kalshiYes != null && kalshiYes >= 0.5;
   const agree = kalshiYes == null || lean === "wait" ? null : botYes === kalshiUp;
   const secs = left == null ? null : left / 1000;
-  const sigma = view.model.sigmaDollar;
+  const sigma = view.model.paused ? null : view.model.sigmaDollar;
   const typical = sigma != null && secs != null ? sigma * Math.sqrt(Math.max(secs, 1) / 900) : null;
   const room = move == null ? null : Math.abs(move);
   const fallingTowardLine = move != null && pulse.moves.find((row) => row.ms === 30_000)?.delta != null && Math.sign(move) !== 0 && Math.sign(pulse.moves.find((row) => row.ms === 30_000)?.delta ?? 0) !== Math.sign(move);
@@ -266,7 +240,7 @@ export function Terminal({ initial }: { initial: Snapshot }) {
       : `BTC is ${money(Math.abs(move))} ${move >= 0 ? "above" : "below"} the start line with ${Math.round(secs)} seconds left. ${
           typical == null
             ? "A usual move for that much time is not ready yet."
-            : `BTC often moves about ${money(typical)} in that time, so ${room != null && typical && room > typical ? "there is more room than a usual move." : "the start line is still within reach."}`
+            : `The model estimates a one-standard-deviation move of ${money(typical)} in that time, so ${room != null && typical && room > typical ? "there is more room than a usual move." : "the start line is still within reach."}`
         }`;
 
   return (
@@ -278,8 +252,9 @@ export function Terminal({ initial }: { initial: Snapshot }) {
         <section className="grid gap-3 lg:grid-cols-10">
           <article className="relative overflow-hidden border border-line bg-surface p-2 lg:col-span-7">
             <p className="px-1 text-[11px] tracking-[0.18em] text-muted">LIVE WINDOW</p>
-            <p className="px-1 font-mono text-xs text-muted">Start line {money(start)} · room {signed(move)}</p>
-            <PriceChart candles={windowCandles} start={start} current={spot} band={flip.zone} tall />
+            <p className="px-1 font-mono text-xs text-muted">Coinbase window open {money(start)} · room {signed(move)}</p>
+            <PriceChart candles={windowCandles} start={start} current={spot} band={flip.zone} shadeFrom={secs != null && secs <= 60 ? win + 840 : null} tall />
+            <p className="mt-2 px-1 text-xs text-muted">Coinbase spot-close forecast. Kalshi settles from the final 60-second BRTI average; Coinbase can disagree. {marketMatches && currentMarket.strike != null ? `Official target ${money(currentMarket.strike)} · ${currentMarket.strikeRule === "greater_or_equal" ? "at or above" : currentMarket.strikeRule === "greater" ? "strictly above" : "check market rules"}.` : "Official target unavailable."}</p>
             <button type="button" className="mt-2 px-1 text-xs tracking-widest text-accent" onClick={() => setTvInterval(tvInterval === "off" ? "1" : "off")}>
               {tvInterval === "off" ? "SHOW TRADINGVIEW" : "HIDE TRADINGVIEW"}
             </button>
@@ -297,9 +272,12 @@ export function Terminal({ initial }: { initial: Snapshot }) {
             <p className={`mt-3 text-center font-mono text-5xl ${leanClass(lean)}`}>{lean === "yes" ? "YES" : lean === "no" ? "NO" : "WAIT"}</p>
             <p className="text-center text-xs tracking-widest text-muted">ESTIMATED CHANCE</p>
             <p className="text-center font-mono text-3xl">{pct == null ? "—" : `${pct}%`}</p>
-            <p className="mt-2 text-center text-xs text-warn">MODEL RELIABILITY · STILL LEARNING</p>
-            <p className="mt-1 text-center text-[11px] leading-snug text-muted">The situation can look one-sided. We do not yet have enough finished windows to prove the percent is perfectly calibrated.</p>
+            <p className="mt-2 text-center text-xs text-warn">EXPERIMENTAL · UNCALIBRATED</p>
+            <p className="mt-1 text-center text-[11px] leading-snug text-muted">This estimates Coinbase finishing above its window open. Accuracy is measured from frozen predictions; no automatic learning is claimed.</p>
             <TimerRing leftMs={left} />
+            {view.model.paused ? <p role="status" className="mt-2 text-sm text-warn">Estimate paused: {view.model.reason}</p> : null}
+            {secs != null && secs <= 60 ? <p className="mt-2 border border-warn p-2 text-sm text-warn">SETTLEMENT MINUTE · Spot forecast only. Official BRTI running average unavailable.</p> : <p className="mt-2 text-center text-xs text-muted">Settlement minute in {secs == null ? "—" : `${Math.max(0, Math.ceil(secs - 60))}s`}</p>}
+            <p className="mt-2 text-xs text-muted">{view.model.matches} comparable completed windows · {view.model.volLabel}</p>
             <p className={`mt-3 text-center font-mono text-sm ${move != null && move > 0.005 ? "text-up" : move != null && move < -0.005 ? "text-down" : "text-muted"}`}>
               {move == null
                 ? "Waiting for the start line"
@@ -341,7 +319,7 @@ export function Terminal({ initial }: { initial: Snapshot }) {
         </article>
 
         <article className="border border-line bg-surface p-3">
-          <p className="text-[11px] tracking-[0.18em] text-muted">OUR BOT VS KALSHI</p>
+          <p className="text-[11px] tracking-[0.18em] text-muted">SPOT MODEL / KALSHI CONTEXT</p>
           <p className="text-[11px] text-muted">Prediction Market Direction · Kalshi Implied Probability & Market Microstructure</p>
           {kalshiYes == null ? (
             <p className="mt-2 text-sm text-warn">Kalshi is temporarily unavailable. The bot call above still works.</p>
@@ -361,7 +339,7 @@ export function Terminal({ initial }: { initial: Snapshot }) {
           )}
           {agree == null ? null : (
             <p className={`mt-3 text-sm ${agree ? "text-up" : "text-warn"}`}>
-              {agree ? "They agree. Agreement is not proof." : "They disagree. Our bot and Kalshi traders are pointing different ways."}
+              {agree ? "Same directional lean, different settlement targets." : "Different leans. Spot close and BRTI settlement are different targets."}
             </p>
           )}
           {kalshiDelta != null ? (
@@ -453,6 +431,8 @@ export function Terminal({ initial }: { initial: Snapshot }) {
         </article>
 
         <Recent frozen={frozen} />
+        {!storageOk ? <p role="status" className="text-sm text-warn">Browser storage is unavailable. Predictions remain in memory only.</p> : null}
+        <p className="text-xs text-muted">Spot age {spotAt == null || now == null ? "unknown" : `${Math.max(0, Math.floor((now - spotAt) / 1000))}s`} · Kalshi book age {query.data.bookAt == null || now == null ? "unknown" : `${Math.max(0, Math.floor((now - query.data.bookAt) / 1000))}s`} · Last snapshot {new Date(query.data.fetchedAt).toISOString()}</p>
 
         <button type="button" className="border border-line px-3 py-2 text-left text-xs tracking-widest" onClick={() => setCore((v) => !v)}>
           {core ? "HIDE ADVANCED DETAILS" : "ADVANCED DETAILS"}
@@ -468,9 +448,10 @@ export function Terminal({ initial }: { initial: Snapshot }) {
               <p>Window high {money(windowCandles.reduce((m, c) => Math.max(m, c.h), 0) || null)} · low {money(windowCandles.reduce((m, c) => Math.min(m, c.l), Number.POSITIVE_INFINITY) || null)}</p>
               <p>Polymarket is hidden. It is not verified against this 15-minute window, so a missing price is not shown as 0%.</p>
             </article>
-            <ModelCore scored={scored} frozen={frozen} />
+            <ModelCore frozen={frozen} />
           </div>
         ) : null}
+        <footer className="flex flex-wrap justify-between gap-3 py-4 text-xs text-muted"><span>No orders are placed. Fees and slippage are not optional.</span><a className="text-accent" href="https://kalshi.com/markets/kxbtc15m" target="_blank" rel="noreferrer">View on Kalshi</a></footer>
       </div>
     </main>
   );
@@ -570,6 +551,7 @@ function cents(n: number | null | undefined) {
 }
 
 function plainDoing(regime: string, vol: string) {
+  if (regime === "UNKNOWN" || vol === "UNKNOWN") return { title: "COLLECTING HISTORY", lean: "wait" as const, why: "Not enough recent prices to describe this interval." };
   if (vol === "HIGH" || vol === "EXTREME") return { title: "MOVING FAST", lean: "warn" as const, why: "BTC is moving more than usual." };
   if (regime.includes("UP")) return { title: "MOVING UP", lean: "yes" as const, why: "BTC has been climbing." };
   if (regime.includes("DOWN")) return { title: "MOVING DOWN", lean: "no" as const, why: "BTC has been falling." };
@@ -644,7 +626,7 @@ function Guide() {
     <section className="border border-line bg-surface px-3 py-2 text-sm">
       <p className="text-[11px] tracking-[0.18em] text-muted">QUICK GUIDE</p>
       <p><span className="text-up">Green</span> means up / YES. <span className="text-down">Red</span> means down / NO. <span className="text-warn">Yellow</span> means mixed. <span className="text-muted">Gray</span> means quiet or not enough.</p>
-      <p className="text-muted">YES = finish above the start price. NO = finish below it. WAIT = no clear advantage.</p>
+      <p className="text-muted">YES = finish above the start price. NO = finish at or below it. WAIT = no clear model lean.</p>
     </section>
   );
 }
@@ -861,7 +843,7 @@ function Recent({ frozen }: { frozen: Frozen[] }) {
   const rows = frozen.filter((row) => row.result).slice(0, 8);
   return (
     <article className="border border-line bg-surface p-3">
-      <p className="text-[11px] tracking-[0.18em] text-muted">RECENT RESULTS</p>
+      <p className="text-[11px] tracking-[0.18em] text-muted">FROZEN SPOT FORECAST RESULTS</p>
       {rows.length === 0 ? (
         <p className="mt-2 text-sm text-muted">No settled live predictions yet. Past candles are not rewritten into fake saved calls.</p>
       ) : (
@@ -876,32 +858,23 @@ function Recent({ frozen }: { frozen: Frozen[] }) {
           ))}
         </ul>
       )}
-      <p className="mt-2 text-[11px] text-muted">Results appear after a window you watched actually ends. WAIT is skipped, not scored.</p>
+      <p className="mt-2 text-[11px] text-muted">Calls freeze at T+30–60s while this tab is open. Late visits are skipped. Coinbase close results are not Kalshi settlements; WAIT counts in probability scoring.</p>
     </article>
   );
 }
 
-function ModelCore({ scored, frozen }: { scored: ReturnType<typeof scorePastWindows>; frozen: Frozen[] }) {
-  const settled = frozen.filter((row) => row.result && row.result !== "WAIT" && row.pUp != null);
-  const waits = frozen.filter((row) => row.result === "WAIT").length;
-  const correct = settled.filter((row) => row.result === "CORRECT").length;
-  const brier = settled.length
-    ? settled.reduce((sum, row) => {
-        const finishedUp = (row.call === "YES" && row.result === "CORRECT") || (row.call === "NO" && row.result === "WRONG");
-        return sum + ((row.pUp ?? 0.5) - (finishedUp ? 1 : 0)) ** 2;
-      }, 0) / settled.length
-    : null;
-  const look = scored.filter((row) => row.verdict !== "WAIT");
-  const lookCorrect = look.filter((row) => row.verdict === "CORRECT").length;
+function ModelCore({ frozen }: { frozen: Frozen[] }) {
+  const stats = evaluationSummary(frozen);
   return (
     <article className="border border-line bg-surface p-3 text-sm">
-      <p className="text-[11px] tracking-[0.18em] text-muted">MODEL CORE</p>
-      <p className="mt-2">MODEL HEALTH <span className="text-warn">LEARNING</span></p>
-      <p className="text-muted">Probability is the existing baseline: short momentum plus distance from the window start, squeezed with a tanh. It is not a fitted logistic model and it is not calibrated.</p>
-      <p className="mt-2 font-mono text-xs">LIVE STORED CALLS {settled.length} directional · {waits} waits · {settled.length ? `${correct}/${settled.length} correct` : "INSUFFICIENT DATA"}</p>
-      <p className="font-mono text-xs">BRIER {brier == null ? "INSUFFICIENT DATA" : brier.toFixed(3)} · LOG LOSS not reported until more settled calls exist</p>
-      <p className="mt-2 font-mono text-xs">CANDLE LOOKBACK {look.length ? `${lookCorrect}/${look.length} directional` : "INSUFFICIENT DATA"} on the last loaded minutes. This uses only price before each window and is too small to claim an edge.</p>
-      <p className="mt-2 text-xs text-muted">No feature has enough out-of-sample samples to be promoted or removed. Polymarket, order book, and whale flow are displayed and stored as context. They are not added into the percent.</p>
+      <p className="text-xs tracking-widest text-muted">MODEL METHOD & CALIBRATION</p>
+      <p className="mt-2 text-warn">EXPERIMENTAL · UNCALIBRATED · spot-close-v2</p>
+      <p className="mt-2 text-muted">Completed one-minute log returns only: variance = 75% last 60 returns + 25% last 15. Forecast uses the normal CDF of log(spot/open) plus a small momentum drift, divided by volatility × √minutes left. Drift = 10% of the five-minute return per minute, capped at five minutes. Probabilities shrink 15% toward 50%.</p>
+      <p className="mt-2 text-muted">Comparable windows match signed distance / volatility and volatility at the same elapsed minute, using only features available then. At least 20 matches are required to blend a smoothed empirical rate (at most 25% weight). These assumptions require held-out validation.</p>
+      <p className="mt-2 font-mono text-xs">{stats.count} completed · {stats.directional} directional · {stats.waits} WAIT · {stats.directional ? `${stats.correct}/${stats.directional} correct (${Math.round(stats.correct / stats.directional * 100)}%)` : "Accuracy: collecting predictions"}</p>
+      <p className="mt-2 font-mono text-xs">Brier {stats.brier == null ? "—" : stats.brier.toFixed(3)} · 50/50 baseline 0.250 · Log loss {stats.logLoss == null ? "—" : stats.logLoss.toFixed(3)} (lower is better; includes WAIT)</p>
+      {stats.count > 0 ? <div className="mt-3 overflow-x-auto"><table className="w-full text-left text-xs"><thead><tr><th>P(up) bucket</th><th>n</th><th>Mean forecast</th><th>Realized up</th></tr></thead><tbody>{stats.buckets.filter((b) => b.count > 0).map((b) => <tr key={b.label}><td className="py-2">{b.label}</td><td>{b.count}</td><td>{Math.round(b.predicted! * 100)}%</td><td>{Math.round(b.observed! * 100)}%</td></tr>)}</tbody></table></div> : <p className="mt-2 text-muted">No completed v2 forecasts yet. Older model records are excluded.</p>}
+      <p className="mt-2 text-xs text-muted">Recorded locally in this browser, only at T+30–60s; not an independently audited track record. Small samples and tab-open selection can bias results. Order book, whale flow and radar remain context, not extra votes in the probability. A positive quoted difference alone does not establish profitability.</p>
     </article>
   );
 }

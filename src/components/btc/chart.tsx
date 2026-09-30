@@ -47,6 +47,7 @@ function Overlay(
         })();
   return (
     <g>
+      {shade}
       {props.band ? (
         <rect
           x={left}

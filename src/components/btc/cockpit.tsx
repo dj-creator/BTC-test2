@@ -276,7 +276,7 @@ function OutlookPanel({
   const xAdj = pulse?.ok ? whaleAdjust(xScore, false) : 0;
   const wAdj = whaleAdjust(whaleScore, Math.abs(whaleScore) > 0.85);
   const pack = useMemo(() => {
-    const built = outlookNow({ candles, spot, start, windowStart, asks, now: Date.now() });
+    const built = outlookNow({ candles, spot, start, windowStart, asks, now: Date.now(), spotAt: useLive.getState().tickAt });
     const base = built.model.pUp;
     const finalP = base == null ? null : Math.min(0.92, Math.max(0.08, base + xAdj + wAdj));
     const outlook = {
