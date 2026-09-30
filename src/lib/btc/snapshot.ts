@@ -34,15 +34,15 @@ function ruleOf(strikeType: string | undefined): StrikeRule {
   return "unknown";
 }
 
-async function fetchKalshi(): Promise<{ market: MarketQuote | null; error: string | null }> {
+async function fetchKalshi(): Promise<{ market: MarketQuote | null; error: string | null; at: number }> {
   const now = Date.now();
   if (kalshiCache && now - kalshiCache.at < 10_000) {
-    return { market: kalshiCache.market, error: kalshiCache.error };
+    return { market: kalshiCache.market, error: kalshiCache.error, at: kalshiCache.at };
   }
   try {
     const res = await fetch(
       "https://api.elections.kalshi.com/trade-api/v2/markets?series_ticker=KXBTC15M&status=open&limit=5",
-      { headers: { accept: "application/json" } },
+      { headers: { accept: "application/json" }, signal: AbortSignal.timeout(8000) },
     );
     if (!res.ok) throw new Error(`Kalshi ${res.status}`);
     const body = (await res.json()) as { markets?: KalshiMarket[] };
@@ -54,7 +54,7 @@ async function fetchKalshi(): Promise<{ market: MarketQuote | null; error: strin
     const picked = open[0]?.m;
     if (!picked) {
       kalshiCache = { at: now, market: null, error: "No open 15-minute market" };
-      return { market: null, error: kalshiCache.error };
+      return { market: null, error: kalshiCache.error, at: now };
     }
     const market: MarketQuote = {
       ticker: picked.ticker ?? "KXBTC15M",
@@ -72,18 +72,18 @@ async function fetchKalshi(): Promise<{ market: MarketQuote | null; error: strin
       openInterest: dollars(picked.open_interest_fp),
     };
     kalshiCache = { at: now, market, error: null };
-    return { market, error: null };
+    return { market, error: null, at: now };
   } catch (err) {
     const error = err instanceof Error ? err.message : "Kalshi unavailable";
     kalshiCache = { at: now, market: null, error };
-    return { market: null, error };
+    return { market: null, error, at: now };
   }
 }
 
-async function fetchGranularity(seconds: number, keep: number): Promise<Candle[]> {
+async function fetchGranularity(seconds: number, keep: number, end?: number): Promise<Candle[]> {
   const res = await fetch(
-    `https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=${seconds}`,
-    { headers: { accept: "application/json" } },
+    `https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=${seconds}${end == null ? "" : `&start=${new Date((end - seconds * keep) * 1000).toISOString()}&end=${new Date(end * 1000).toISOString()}`}`,
+    { headers: { accept: "application/json" }, signal: AbortSignal.timeout(8000) },
   );
   if (!res.ok) throw new Error(`Candles ${res.status}`);
   const rows = (await res.json()) as number[][];
@@ -103,7 +103,16 @@ async function fetchGranularity(seconds: number, keep: number): Promise<Candle[]
 async function fetchCandles(): Promise<Candle[]> {
   const now = Date.now();
   if (candleCache && now - candleCache.at < 30_000) return candleCache.candles;
-  const candles = await fetchGranularity(60, 180);
+  const recent = await fetchGranularity(60, 300);
+  let older = candleCache?.candles ?? [];
+  // Bootstrap enough prior windows for matching; reuse the overlap on subsequent polls.
+  if (older.length === 0 && recent.length) {
+    const end = recent[0]!.t;
+    const pages = await Promise.allSettled([fetchGranularity(60, 300, end), fetchGranularity(60, 300, end - 18_000)]);
+    older = pages.flatMap((page) => page.status === "fulfilled" ? page.value : []);
+  }
+  const merged = new Map([...older, ...recent].map((c) => [c.t, c]));
+  const candles = [...merged.values()].sort((a, b) => a.t - b.t).slice(-900);
   candleCache = { at: now, candles };
   return candles;
 }
@@ -121,7 +130,7 @@ async function fetchHistory(): Promise<SettledWindow[]> {
   if (historyCache && now - historyCache.at < 30_000) return historyCache.rows;
   const res = await fetch(
     "https://api.elections.kalshi.com/trade-api/v2/markets?series_ticker=KXBTC15M&status=settled&limit=12",
-    { headers: { accept: "application/json" } },
+    { headers: { accept: "application/json" }, signal: AbortSignal.timeout(8000) },
   );
   if (!res.ok) throw new Error(`Kalshi history ${res.status}`);
   const body = (await res.json()) as {
@@ -159,7 +168,7 @@ async function fetchHistory(): Promise<SettledWindow[]> {
 
 async function fetchSpot(): Promise<number | null> {
   const res = await fetch("https://api.coinbase.com/v2/prices/BTC-USD/spot", {
-    headers: { accept: "application/json" },
+    headers: { accept: "application/json" }, signal: AbortSignal.timeout(8000),
   });
   if (!res.ok) throw new Error(`Spot ${res.status}`);
   const body = (await res.json()) as { data?: { amount?: string } };
@@ -193,7 +202,7 @@ export const getSnapshot = createServerFn({ method: "GET" }).handler(async (): P
     spot: spotResult.spot,
     spotAt: spotResult.spot == null ? null : fetchedAt,
     spotSource: "Coinbase BTC/USD",
-    bookAt: kalshi.market ? fetchedAt : null,
+    bookAt: kalshi.market ? kalshi.at : null,
     kalshiOk: kalshi.error == null && kalshi.market != null,
     kalshiError: kalshi.error ?? spotResult.error ?? candleResult.error,
     market: kalshi.market,

@@ -1,4 +1,4 @@
-import { buildModel, fifteenMinuteWindows } from "./model";
+import { buildModel, fifteenMinuteWindows } from "./model.ts";
 import type { Candle, MarketQuote } from "./types";
 
 export type Signal = "up" | "down" | "wait";
@@ -14,8 +14,8 @@ export type Outlook = {
 function zoneFor(confidencePct: number) {
   if (confidencePct < 55) return "No clear edge";
   if (confidencePct < 60) return "Slight lean";
-  if (confidencePct < 70) return "Moderate confidence";
-  return "Strong";
+  if (confidencePct < 70) return "Moderate model lean";
+  return "Large model lean";
 }
 
 export function describeOutlook(input: {
@@ -24,15 +24,16 @@ export function describeOutlook(input: {
   spot: number | null;
   start: number | null;
   paused: boolean;
+  reason?: string | null;
 }): Outlook {
   if (input.paused || input.pUp == null) {
     return {
       signal: "wait",
       confidence: null,
-      zone: "Not enough history yet",
+      zone: "Estimate paused",
       paused: true,
       sentences: [
-        "The live price is on, but there is not enough recent history to lean up or down.",
+        input.reason ?? "Valid price, target, and continuous history are required.",
         "Wait until the picture is clearer.",
       ],
     };
@@ -58,7 +59,7 @@ export function describeOutlook(input: {
   }
   if (signal === "wait") sentences.push("The advantage is too small to call, so this is a wait.");
   else if (pct >= 70) sentences.push("The lean is strong, but it is still not a sure thing.");
-  else if (pct >= 60) sentences.push("There is a real lean, but it is not a sure thing.");
+  else if (pct >= 60) sentences.push("The model leans this way; its probabilities have not been calibrated.");
   else sentences.push("The advantage is small, so this is not a strong signal.");
   return { signal, confidence, zone, paused: false, sentences: sentences.slice(0, 3) };
 }
@@ -88,12 +89,15 @@ export function outlookNow(input: {
   windowStart: number;
   asks: MarketQuote | null;
   now: number;
+  spotAt?: number | null;
 }) {
   const model = buildModel({
     candles: input.candles,
     spot: input.spot,
-    market: input.start != null ? marketAt(input.windowStart, input.start, input.asks) : null,
+    market: input.start != null ? marketAt(input.windowStart, input.start, null) : null,
     now: input.now,
+    spotAt: input.spotAt,
+    target: "spot",
   });
   return {
     model,
@@ -103,6 +107,7 @@ export function outlookNow(input: {
       spot: input.spot,
       start: input.start,
       paused: model.paused,
+      reason: model.reason,
     }),
   };
 }
@@ -128,6 +133,8 @@ export function scorePastWindows(candles: Candle[]): ScoredWindow[] {
       spot: row.open,
       market: marketAt(row.start, row.open, null),
       now: row.start * 1000,
+      spotAt: row.start * 1000,
+      target: "spot",
     });
     const outlook = describeOutlook({
       pUp: model.pUp,
@@ -135,8 +142,9 @@ export function scorePastWindows(candles: Candle[]): ScoredWindow[] {
       spot: row.open,
       start: row.open,
       paused: model.paused,
+      reason: model.reason,
     });
-    const finishedUp = row.close >= row.open;
+    const finishedUp = row.close > row.open;
     let verdict: ScoredWindow["verdict"] = "WAIT";
     if (outlook.signal === "up") verdict = finishedUp ? "CORRECT" : "WRONG";
     if (outlook.signal === "down") verdict = finishedUp ? "WRONG" : "CORRECT";
